@@ -89,81 +89,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64) -> Result<crate::room::LockResult> {
-        // First, clean up expired lock on this symbol if any
-        self.conn.execute(
-            "DELETE FROM locks WHERE symbol_id = ?1
-             AND (julianday('now') - julianday(locked_at)) * 86400 > ttl_seconds",
-            params![symbol_id],
-        )?;
-
-        // Check existing lock
-        let existing: Option<(String, String)> = self.conn.query_row(
-            "SELECT agent_id, intent FROM locks WHERE symbol_id = ?1",
-            params![symbol_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).ok();
-
-        match existing {
-            Some((ref agent, _)) if agent == agent_id => {
-                // Already locked by this agent, update intent and TTL
-                self.conn.execute(
-                    "UPDATE locks SET intent = ?1, locked_at = datetime('now'), ttl_seconds = ?4
-                     WHERE symbol_id = ?2 AND agent_id = ?3",
-                    params![intent, symbol_id, agent_id, ttl_seconds],
-                )?;
-                Ok(crate::room::LockResult::Granted)
-            }
-            Some((by_agent, by_intent)) => {
-                Ok(crate::room::LockResult::Blocked { by_agent, by_intent })
-            }
-            None => {
-                self.conn.execute(
-                    "INSERT INTO locks (symbol_id, agent_id, intent, ttl_seconds) VALUES (?1, ?2, ?3, ?4)",
-                    params![symbol_id, agent_id, intent, ttl_seconds],
-                )?;
-                Ok(crate::room::LockResult::Granted)
-            }
-        }
-    }
-
-    pub fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM locks WHERE symbol_id = ?1 AND agent_id = ?2",
-            params![symbol_id, agent_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn release_all(&self, agent_id: &str) -> Result<usize> {
-        let count = self.conn.execute(
-            "DELETE FROM locks WHERE agent_id = ?1",
-            params![agent_id],
-        )?;
-        Ok(count)
-    }
-
-    pub fn all_locks(&self) -> Result<Vec<(String, String, String, String, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT l.symbol_id, l.agent_id, l.intent, l.locked_at, COALESCE(l.ttl_seconds, 600)
-             FROM locks l ORDER BY l.agent_id, l.symbol_id"
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, i64>(4)? as u64))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    pub fn locks_for_agent(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT symbol_id, intent FROM locks WHERE agent_id = ?1"
-        )?;
-        let rows = stmt.query_map(params![agent_id], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
     pub fn available_symbols_in_files(&self, files: &[&str]) -> Result<Vec<String>> {
         if files.is_empty() {
             return Ok(Vec::new());
@@ -244,27 +169,6 @@ impl Database {
         Ok(results)
     }
 
-    /// Check if a specific lock is expired
-    pub fn is_lock_expired(&self, symbol_id: &str) -> Result<bool> {
-        let expired: bool = self.conn.query_row(
-            "SELECT (julianday('now') - julianday(locked_at)) * 86400 > COALESCE(ttl_seconds, 600)
-             FROM locks WHERE symbol_id = ?1",
-            params![symbol_id],
-            |row| row.get(0),
-        ).unwrap_or(false);
-        Ok(expired)
-    }
-
-    /// Garbage-collect all expired locks, returns how many were removed
-    pub fn gc_expired_locks(&self) -> Result<usize> {
-        let count = self.conn.execute(
-            "DELETE FROM locks
-             WHERE (julianday('now') - julianday(locked_at)) * 86400 > COALESCE(ttl_seconds, 600)",
-            [],
-        )?;
-        Ok(count)
-    }
-
     // ── Session management ──
 
     pub fn create_session(&self, name: &str, branch: &str, base_branch: &str) -> Result<()> {
@@ -297,12 +201,4 @@ impl Database {
         Ok(())
     }
 
-    /// Refresh the TTL for all locks held by an agent
-    pub fn refresh_ttl(&self, agent_id: &str, ttl_seconds: u64) -> Result<usize> {
-        let count = self.conn.execute(
-            "UPDATE locks SET locked_at = datetime('now'), ttl_seconds = ?1 WHERE agent_id = ?2",
-            params![ttl_seconds, agent_id],
-        )?;
-        Ok(count)
-    }
 }

@@ -24,25 +24,18 @@ serde_json = "1"
 
 # Errors
 anyhow = "1"
-thiserror = "2"
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 
-# Git
-git2 = "0.19"
-
-# Async (for socket notifications)
-tokio = { version = "1", features = ["full"] }
+# Async (for S3 runtime)
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 # Glob for file discovery
 glob = "0.3"
 
 # Colors in terminal
 colored = "2"
-
-# UUID for agent IDs
-uuid = { version = "1", features = ["v4"] }
 
 # Cloud storage (S3/R2/GCS/Azure)
 aws-config = { version = "1", features = ["behavior-version-latest"] }

@@ -5,9 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-// LockResult is now in db::lock_store
-pub use crate::db::lock_store::LockResult;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomEvent {
     pub event_type: EventType,
@@ -23,7 +20,7 @@ pub enum EventType {
 }
 
 pub struct Room {
-    pub socket_path: PathBuf,
+    socket_path: PathBuf,
 }
 
 impl Room {

@@ -16,15 +16,18 @@ pub struct S3LockStore {
     client: Client,
     bucket: String,
     prefix: String,
+    _runtime: tokio::runtime::Runtime,
     rt: tokio::runtime::Handle,
 }
 
 impl S3LockStore {
-    pub fn new(client: Client, bucket: String, prefix: Option<String>, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(client: Client, bucket: String, prefix: Option<String>, runtime: tokio::runtime::Runtime) -> Self {
+        let rt = runtime.handle().clone();
         Self {
             client,
             bucket,
             prefix: prefix.unwrap_or_else(|| ".grit/locks/".to_string()),
+            _runtime: runtime,
             rt,
         }
     }
@@ -52,11 +55,13 @@ impl S3LockStore {
             Client::from_conf(s3_config)
         });
 
+        let handle = rt.handle().clone();
         Ok(Self {
             client,
             bucket: config.bucket.clone(),
             prefix: config.prefix.clone().unwrap_or_else(|| ".grit/locks/".to_string()),
-            rt: rt.handle().clone(),
+            _runtime: rt,
+            rt: handle,
         })
     }
 

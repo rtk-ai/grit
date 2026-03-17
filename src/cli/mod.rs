@@ -1,9 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use colored::Colorize;
+
 use crate::config::GritConfig;
 use crate::db::Database;
-use crate::db::lock_store::{LockStore, LockResult};
+use crate::db::lock_store::{LockEntry, LockStore, LockResult};
 use crate::db::sqlite_store::SqliteLockStore;
 use crate::db::s3_store::S3Config;
 use crate::git::GitRepo;
@@ -166,7 +168,34 @@ pub enum ConfigAction {
     Show,
 }
 
+/// Validate agent/session identifiers to prevent path traversal and argument injection
+fn validate_identifier(id: &str, label: &str) -> Result<()> {
+    if id.is_empty() {
+        anyhow::bail!("Invalid {}: must not be empty", label);
+    }
+    if id.contains('/') || id.contains('\\') || id.contains("..") || id.starts_with('-') {
+        anyhow::bail!("Invalid {}: '{}' contains forbidden characters (/, \\, ..) or starts with -", label, id);
+    }
+    if !id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        anyhow::bail!("Invalid {}: '{}' must contain only alphanumeric, hyphens, underscores, dots", label, id);
+    }
+    Ok(())
+}
+
 pub fn run(cli: Cli) -> Result<()> {
+    // Validate identifiers early to prevent path traversal / argument injection
+    match &cli.command {
+        Command::Claim { agent, .. } | Command::Release { agent, .. }
+        | Command::Done { agent } | Command::Plan { agent, .. }
+        | Command::Heartbeat { agent, .. } => validate_identifier(agent, "agent ID")?,
+        Command::Session { action } => {
+            if let SessionAction::Start { name } = action {
+                validate_identifier(name, "session name")?;
+            }
+        }
+        _ => {}
+    }
+
     match cli.command {
         Command::Init => cmd_init(&cli.repo),
         Command::Claim { agent, intent, ttl, symbols } => cmd_claim(&cli.repo, &agent, &intent, ttl, &symbols),
@@ -280,12 +309,12 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]
         let git_repo = GitRepo::open(repo)?;
         match git_repo.create_worktree(agent) {
             Ok(wt_path) => {
-                use colored::Colorize;
+
                 println!("{} Worktree: {}", "+".cyan(), wt_path.display());
             }
             Err(e) => {
                 // Worktree may already exist, that's fine
-                let msg = format!("{}", e);
+                let msg = e.to_string();
                 if !msg.contains("already exists") {
                     eprintln!("  warn: could not create worktree: {}", e);
                 }
@@ -294,7 +323,7 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]
     }
 
     if !granted.is_empty() {
-        use colored::Colorize;
+
         println!("{} Granted:", "+".green());
         for s in &granted {
             println!("  {} {}", ">".green(), s);
@@ -310,7 +339,7 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]
     }
 
     if !blocked.is_empty() {
-        use colored::Colorize;
+
         println!("{} Blocked:", "x".red());
         for (s, by, intent) in &blocked {
             println!("  {} {} -- held by {} ({})", ">".red(), s, by, intent);
@@ -375,8 +404,6 @@ fn cmd_status(repo: &str) -> Result<()> {
         return Ok(());
     }
 
-    use colored::Colorize;
-    use crate::db::lock_store::LockEntry;
 
     // Group by agent
     let mut by_agent: std::collections::BTreeMap<String, Vec<&LockEntry>> =
@@ -420,7 +447,7 @@ fn cmd_symbols(repo: &str, file_filter: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    use colored::Colorize;
+
 
     let mut current_file = String::new();
     for (_id, file, name, kind, locked_by) in &symbols {
@@ -446,7 +473,7 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
     let keywords: Vec<&str> = intent.split_whitespace().collect();
     let suggestions = db.search_symbols(&keywords)?;
 
-    use colored::Colorize;
+
     println!("Planning for: {}", intent.bold());
     println!("\nRelevant symbols:");
 
@@ -486,7 +513,7 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
         return Ok(());
     }
 
-    use colored::Colorize;
+
     println!("{} Agent {} finishing:", "+".green(), agent.bold());
     for (sym, _intent) in &locks {
         println!("  {} releasing {}", ">".dimmed(), sym);
@@ -499,7 +526,7 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
             println!("{} Merged branch agent/{}", "+".green(), agent);
         }
         Err(e) => {
-            let msg = format!("{}", e);
+            let msg = e.to_string();
             if msg.contains("not found") || msg.contains("does not exist") {
                 // No worktree, that's fine
             } else {
@@ -514,7 +541,7 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
             println!("{} Removed worktree for {}", "+".green(), agent);
         }
         Err(e) => {
-            let msg = format!("{}", e);
+            let msg = e.to_string();
             if !msg.contains("not found") && !msg.contains("does not exist") {
                 eprintln!("  warn: could not remove worktree: {}", e);
             }
@@ -560,7 +587,7 @@ fn cmd_watch(repo: &str) -> Result<()> {
                 }
                 match serde_json::from_str::<RoomEvent>(&data) {
                     Ok(event) => {
-                        use colored::Colorize;
+        
                         let prefix = match event.event_type {
                             EventType::Claimed => "CLAIMED".green(),
                             EventType::Released => "RELEASED".yellow(),
@@ -597,7 +624,7 @@ fn cmd_worktree_list(repo: &str) -> Result<()> {
         return Ok(());
     }
 
-    use colored::Colorize;
+
     println!("{}", "Active worktrees:".bold());
     for agent_id in &worktrees {
         let dir = grit_dir(repo).join("worktrees").join(agent_id);
@@ -644,16 +671,16 @@ fn cmd_session_start(repo: &str, name: &str) -> Result<()> {
     let branch = git_repo.create_session_branch(name)?;
     db.create_session(name, &branch, &base_branch)?;
 
-    use colored::Colorize;
+
     println!("{} Session started: {}", "+".green(), name.bold());
     println!("  branch: {}", branch.cyan());
     println!("  base:   {}", base_branch.dimmed());
-    println!("");
+    println!();
     println!("Agents can now work:");
     println!("  grit claim -a agent-1 -i \"task\" <symbols...>");
     println!("  # edit in .grit/worktrees/agent-1/");
     println!("  grit done -a agent-1");
-    println!("");
+    println!();
     println!("When all agents are done:");
     println!("  grit session pr");
 
@@ -665,7 +692,7 @@ fn cmd_session_status(repo: &str) -> Result<()> {
     let db = Database::open(&dir.join("registry.db"))?;
     let lock_store = resolve_lock_store(repo)?;
 
-    use colored::Colorize;
+
 
     match db.get_active_session()? {
         Some((name, branch, base)) => {
@@ -709,7 +736,7 @@ fn cmd_session_pr(repo: &str, title: Option<&str>) -> Result<()> {
     let locks = lock_store.all_locks()?;
     let worktrees = git_repo.list_worktrees()?;
 
-    use colored::Colorize;
+
 
     if !worktrees.is_empty() {
         println!("{} Warning: {} agents still have active worktrees:", "!".yellow(), worktrees.len());
@@ -758,7 +785,7 @@ fn cmd_session_end(repo: &str, _name: Option<&str>) -> Result<()> {
     let (session_name, _branch, base) = db.get_active_session()?
         .ok_or_else(|| anyhow::anyhow!("No active session"))?;
 
-    use colored::Colorize;
+
 
     // GC any expired locks
     let expired = lock_store.gc_expired_locks()?;
@@ -793,16 +820,16 @@ fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &
     };
     config.save(&dir)?;
 
-    use colored::Colorize;
+
     println!("{} Backend set to S3", "+".green());
     println!("  bucket:   {}", bucket.cyan());
     if let Some(ep) = endpoint {
         println!("  endpoint: {}", ep.cyan());
     }
     println!("  region:   {}", region);
-    println!("");
+    println!();
     println!("Compatible with: AWS S3, Cloudflare R2, GCS, Azure Blob, MinIO");
-    println!("");
+    println!();
     println!("Set credentials via environment:");
     println!("  export AWS_ACCESS_KEY_ID=...");
     println!("  export AWS_SECRET_ACCESS_KEY=...");
@@ -818,7 +845,7 @@ fn cmd_config_set_local(repo: &str) -> Result<()> {
     };
     config.save(&dir)?;
 
-    use colored::Colorize;
+
     println!("{} Backend set to local (SQLite)", "+".green());
 
     Ok(())
@@ -828,7 +855,7 @@ fn cmd_config_show(repo: &str) -> Result<()> {
     let dir = grit_dir(repo);
     let config = GritConfig::load(&dir)?;
 
-    use colored::Colorize;
+
     println!("{} Current config:", "*".green());
     println!("  backend: {}", config.backend.cyan());
 

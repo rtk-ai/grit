@@ -34,7 +34,7 @@ impl GitRepo {
 
         // Create a new branch and worktree
         let output = Command::new("git")
-            .args(["worktree", "add", "-b", &branch_name, &wt_path.to_string_lossy()])
+            .args(["worktree", "add", "-b", &branch_name, "--", &wt_path.to_string_lossy()])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git worktree add")?;
@@ -44,7 +44,7 @@ impl GitRepo {
             // If branch already exists, try without -b
             if stderr.contains("already exists") {
                 let output2 = Command::new("git")
-                    .args(["worktree", "add", &wt_path.to_string_lossy(), &branch_name])
+                    .args(["worktree", "add", "--", &wt_path.to_string_lossy(), &branch_name])
                     .current_dir(&self.root)
                     .output()?;
                 if !output2.status.success() {
@@ -67,7 +67,7 @@ impl GitRepo {
         }
 
         let output = Command::new("git")
-            .args(["worktree", "remove", "--force", &wt_path.to_string_lossy()])
+            .args(["worktree", "remove", "--force", "--", &wt_path.to_string_lossy()])
             .current_dir(&self.root)
             .output()
             .context("Failed to run git worktree remove")?;
@@ -80,7 +80,7 @@ impl GitRepo {
         // Clean up the agent branch
         let branch_name = format!("agent/{}", agent_id);
         let _ = Command::new("git")
-            .args(["branch", "-D", &branch_name])
+            .args(["branch", "-D", "--", &branch_name])
             .current_dir(&self.root)
             .output();
 
@@ -209,7 +209,7 @@ impl GitRepo {
         let branch_name = format!("grit/{}", session_name);
 
         let output = Command::new("git")
-            .args(["checkout", "-b", &branch_name])
+            .args(["checkout", "-b", "--", &branch_name])
             .current_dir(&self.root)
             .output()
             .context("Failed to create session branch")?;
@@ -219,7 +219,7 @@ impl GitRepo {
             if stderr.contains("already exists") {
                 // Switch to existing branch
                 let output2 = Command::new("git")
-                    .args(["checkout", &branch_name])
+                    .args(["checkout", "--", &branch_name])
                     .current_dir(&self.root)
                     .output()?;
                 if !output2.status.success() {
