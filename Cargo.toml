@@ -1,0 +1,45 @@
+[package]
+name = "grit"
+version = "0.1.0"
+edition = "2021"
+description = "Coordination layer for parallel AI agents on top of git"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# SQLite
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# AST parsing
+tree-sitter = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Git
+git2 = "0.19"
+
+# Async (for socket notifications)
+tokio = { version = "1", features = ["full"] }
+
+# Glob for file discovery
+glob = "0.3"
+
+# Colors in terminal
+colored = "2"
+
+# UUID for agent IDs
+uuid = { version = "1", features = ["v4"] }
