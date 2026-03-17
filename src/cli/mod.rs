@@ -13,7 +13,7 @@ use crate::parser::SymbolIndex;
 use crate::room::{Room, RoomEvent, EventType, NotificationServer};
 
 #[derive(Parser)]
-#[command(name = "grit", about = "Coordination layer for parallel AI agents on top of git")]
+#[command(name = "grit", version, about = "Coordination layer for parallel AI agents on top of git")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

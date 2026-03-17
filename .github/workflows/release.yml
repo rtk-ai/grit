@@ -1,0 +1,228 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to release'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../grit-${{ matrix.target }}.${{ matrix.archive }} grit
+          cd ../../..
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../grit-${{ matrix.target }}.zip grit.exe
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grit-${{ matrix.target }}
+          path: grit-${{ matrix.target }}.${{ matrix.archive }}
+
+  release:
+    name: Create Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get version
+        id: version
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          echo "version=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release/ \;
+
+      - name: Create checksums
+        run: |
+          cd release
+          sha256sum * > checksums.txt
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew formula
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download checksums
+        run: |
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --repo rtk-ai/grit \
+            --pattern checksums.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse checksums
+        id: sha
+        run: |
+          echo "arm=$(grep aarch64-apple-darwin checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "intel=$(grep x86_64-apple-darwin checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "linux_amd64=$(grep x86_64-unknown-linux-gnu checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "linux_arm64=$(grep aarch64-unknown-linux-gnu checksums.txt | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Update formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          cat > grit.rb << 'FORMULA'
+          class Grit < Formula
+            desc "Coordination layer for parallel AI agents on top of git"
+            homepage "https://github.com/rtk-ai/grit"
+            version "VERSION_PLACEHOLDER"
+            license "MIT"
+
+            on_macos do
+              on_intel do
+                url "https://github.com/rtk-ai/grit/releases/download/TAG_PLACEHOLDER/grit-x86_64-apple-darwin.tar.gz"
+                sha256 "SHA_INTEL_PLACEHOLDER"
+              end
+              on_arm do
+                url "https://github.com/rtk-ai/grit/releases/download/TAG_PLACEHOLDER/grit-aarch64-apple-darwin.tar.gz"
+                sha256 "SHA_ARM_PLACEHOLDER"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/rtk-ai/grit/releases/download/TAG_PLACEHOLDER/grit-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_AMD64_PLACEHOLDER"
+              end
+              on_arm do
+                url "https://github.com/rtk-ai/grit/releases/download/TAG_PLACEHOLDER/grit-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "SHA_LINUX_ARM64_PLACEHOLDER"
+              end
+            end
+
+            def install
+              bin.install "grit"
+            end
+
+            test do
+              assert_match "grit #{version}", shell_output("#{bin}/grit --version")
+            end
+          end
+          FORMULA
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" grit.rb
+          sed -i "s/TAG_PLACEHOLDER/$TAG/g" grit.rb
+          sed -i "s/SHA_INTEL_PLACEHOLDER/${{ steps.sha.outputs.intel }}/g" grit.rb
+          sed -i "s/SHA_ARM_PLACEHOLDER/${{ steps.sha.outputs.arm }}/g" grit.rb
+          sed -i "s/SHA_LINUX_AMD64_PLACEHOLDER/${{ steps.sha.outputs.linux_amd64 }}/g" grit.rb
+          sed -i "s/SHA_LINUX_ARM64_PLACEHOLDER/${{ steps.sha.outputs.linux_arm64 }}/g" grit.rb
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' grit.rb
+
+      - name: Push to homebrew-tap
+        run: |
+          CONTENT=$(base64 -w 0 grit.rb)
+          SHA=$(gh api repos/rtk-ai/homebrew-tap/contents/Formula/grit.rb --jq '.sha' 2>/dev/null || echo "")
+          if [ -n "$SHA" ]; then
+            gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/grit.rb \
+              -f message="grit ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT" \
+              -f sha="$SHA"
+          else
+            gh api -X PUT repos/rtk-ai/homebrew-tap/contents/Formula/grit.rb \
+              -f message="grit ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
