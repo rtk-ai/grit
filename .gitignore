@@ -7,3 +7,4 @@ benchmark-grit-vs-git.pdf
 benchmark-grit-vs-git.png
 gen_pdf.py
 git-agents-problem.*
+.fastembed_cache/
