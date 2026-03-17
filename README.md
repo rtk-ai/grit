@@ -1,8 +1,8 @@
 # grit
 
-**AST-level coordination layer for parallel AI agents on top of git.**
+**Git for AI agents — zero merge conflicts, any number of parallel agents, same codebase.**
 
-> Zero merge conflicts. Any number of agents. Same codebase.
+> When 50 agents work on the same repo, git breaks. Grit doesn't.
 
 [English](#english) | [Francais](#francais) | [Deutsch](#deutsch) | [Espanol](#espanol) | [Portugues](#portugues) | [Italiano](#italiano) | [Nederlands](#nederlands) | [日本語](#日本語) | [中文](#中文) | [한국어](#한국어) | [Русский](#русский) | [العربية](#العربية) | [हिन्दी](#हिन्दी)
 
