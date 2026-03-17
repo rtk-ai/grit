@@ -13,10 +13,6 @@ impl GitRepo {
         Ok(Self { root })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn grit_dir(&self) -> PathBuf {
         self.root.join(".grit")
     }
@@ -105,15 +101,37 @@ impl GitRepo {
 
         let status_str = String::from_utf8_lossy(&status_output.stdout);
         if !status_str.trim().is_empty() {
-            let _ = Command::new("git")
+            let add_output = Command::new("git")
                 .args(["add", "-A"])
                 .current_dir(&wt_path)
-                .output()?;
+                .output()
+                .context("Failed to run git add in worktree")?;
 
-            let _ = Command::new("git")
+            if !add_output.status.success() {
+                anyhow::bail!(
+                    "git add failed in worktree {}: {}",
+                    wt_path.display(),
+                    String::from_utf8_lossy(&add_output.stderr)
+                );
+            }
+
+            let commit_output = Command::new("git")
                 .args(["commit", "-m", &format!("grit: agent {} changes", agent_id)])
                 .current_dir(&wt_path)
-                .output()?;
+                .output()
+                .context("Failed to run git commit in worktree")?;
+
+            if !commit_output.status.success() {
+                let stderr = String::from_utf8_lossy(&commit_output.stderr);
+                // "nothing to commit" is OK (e.g. only untracked files that were gitignored)
+                if !stderr.contains("nothing to commit") {
+                    anyhow::bail!(
+                        "git commit failed in worktree {}: {}",
+                        wt_path.display(),
+                        stderr
+                    );
+                }
+            }
         }
 
         // Acquire merge lock (serialize all merges because git can't handle concurrent ones)
@@ -171,14 +189,35 @@ impl GitRepo {
                     return Ok(FileLock { path: path.to_path_buf() });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Check if the lock is stale (older than 30s)
-                    if let Ok(meta) = fs::metadata(path) {
-                        if let Ok(modified) = meta.modified() {
-                            if modified.elapsed().unwrap_or_default().as_secs() > 30 {
-                                let _ = fs::remove_file(path);
-                                continue;
+                    // Check if the lock is stale:
+                    // 1. If the PID in the file is no longer alive, it's stale
+                    // 2. Fallback: if older than 30s, assume stale
+                    let mut is_stale = false;
+                    if let Ok(contents) = fs::read_to_string(path) {
+                        if let Ok(pid) = contents.trim().parse::<u32>() {
+                            // Check if process is alive (kill with signal 0)
+                            use std::process::Command as Cmd;
+                            if let Ok(output) = Cmd::new("kill").args(["-0", &pid.to_string()]).output() {
+                                if !output.status.success() {
+                                    // Process is dead -- lock is stale
+                                    is_stale = true;
+                                }
                             }
                         }
+                    }
+                    if !is_stale {
+                        // Fallback: time-based staleness
+                        if let Ok(meta) = fs::metadata(path) {
+                            if let Ok(modified) = meta.modified() {
+                                if modified.elapsed().unwrap_or_default().as_secs() > 30 {
+                                    is_stale = true;
+                                }
+                            }
+                        }
+                    }
+                    if is_stale {
+                        let _ = fs::remove_file(path);
+                        continue;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }

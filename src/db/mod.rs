@@ -7,14 +7,63 @@ use rusqlite::{Connection, params};
 
 use crate::parser::Symbol;
 
+/// Apply standard PRAGMA settings to a new SQLite connection.
+pub fn configure_connection(conn: &Connection) -> Result<()> {
+    match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;") {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("locked") || err_str.contains("busy") {
+                anyhow::bail!(
+                    "Database is locked by another process. \
+                     If this persists, check for stale grit processes or remove the WAL files."
+                );
+            }
+            anyhow::bail!("Database configuration failed: {}", e);
+        }
+    }
+}
+
+/// (id, file, name, kind, locked_by_agent)
+pub type SymbolRow = (String, String, String, String, Option<String>);
+
 pub struct Database {
     conn: Connection,
 }
 
 impl Database {
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        let conn = Connection::open(path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to open database {}: {}.\n\
+                 If the file is corrupted, remove it and re-run `grit init`.",
+                path.display(),
+                e
+            )
+        })?;
+        configure_connection(&conn)?;
+
+        // Quick integrity check
+        match conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)) {
+            Ok(ref result) if result == "ok" => {}
+            Ok(detail) => {
+                anyhow::bail!(
+                    "Database {} failed integrity check: {}.\n\
+                     Remove it and re-run `grit init` to rebuild.",
+                    path.display(),
+                    detail
+                );
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "Database {} may be corrupted: {}.\n\
+                     Remove it and re-run `grit init` to rebuild.",
+                    path.display(),
+                    e
+                );
+            }
+        }
+
         Ok(Self { conn })
     }
 
@@ -112,7 +161,7 @@ impl Database {
         Ok(count as usize)
     }
 
-    pub fn list_symbols(&self, file_filter: Option<&str>) -> Result<Vec<(String, String, String, String, Option<String>)>> {
+    pub fn list_symbols(&self, file_filter: Option<&str>) -> Result<Vec<SymbolRow>> {
         let sql = match file_filter {
             Some(_) => "SELECT s.id, s.file, s.name, s.kind, l.agent_id
                         FROM symbols s LEFT JOIN locks l ON s.id = l.symbol_id
@@ -123,7 +172,7 @@ impl Database {
                         ORDER BY s.file, s.start_line",
         };
         let mut stmt = self.conn.prepare(sql)?;
-        let mut results: Vec<(String, String, String, String, Option<String>)> = Vec::new();
+        let mut results: Vec<SymbolRow> = Vec::new();
         match file_filter {
             Some(f) => {
                 let pattern = format!("%{}%", f);
@@ -142,7 +191,7 @@ impl Database {
         Ok(results)
     }
 
-    pub fn search_symbols(&self, keywords: &[&str]) -> Result<Vec<(String, String, String, String, Option<String>)>> {
+    pub fn search_symbols(&self, keywords: &[&str]) -> Result<Vec<SymbolRow>> {
         let conditions: Vec<String> = keywords.iter().enumerate().map(|(i, _)| {
             format!("(s.name LIKE ?{0} OR s.file LIKE ?{0} OR s.id LIKE ?{0})", i + 1)
         }).collect();
@@ -162,7 +211,7 @@ impl Database {
         let params: Vec<String> = keywords.iter().map(|k| format!("%{}%", k)).collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
         let mut rows = stmt.query(param_refs.as_slice())?;
-        let mut results: Vec<(String, String, String, String, Option<String>)> = Vec::new();
+        let mut results: Vec<SymbolRow> = Vec::new();
         while let Some(row) = rows.next()? {
             results.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?));
         }

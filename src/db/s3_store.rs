@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::Utc;
 
@@ -20,18 +21,9 @@ pub struct S3LockStore {
     rt: tokio::runtime::Handle,
 }
 
-impl S3LockStore {
-    pub fn new(client: Client, bucket: String, prefix: Option<String>, runtime: tokio::runtime::Runtime) -> Self {
-        let rt = runtime.handle().clone();
-        Self {
-            client,
-            bucket,
-            prefix: prefix.unwrap_or_else(|| ".grit/locks/".to_string()),
-            _runtime: runtime,
-            rt,
-        }
-    }
+const DEFAULT_LOCK_PREFIX: &str = ".grit/locks/";
 
+impl S3LockStore {
     /// Build from config
     pub fn from_config(config: &S3Config) -> Result<Self> {
         let rt = tokio::runtime::Runtime::new()?;
@@ -48,8 +40,19 @@ impl S3LockStore {
             let sdk_config = loader.load().await;
 
             // Force path-style for R2/MinIO/GCS compatibility
+            // Set reasonable timeouts for CLI usage
+            let timeout_config = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .operation_timeout(std::time::Duration::from_secs(10))
+                .operation_attempt_timeout(std::time::Duration::from_secs(5))
+                .build();
+
+            let retry_config = aws_sdk_s3::config::retry::RetryConfig::standard()
+                .with_max_attempts(3);
+
             let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
                 .force_path_style(true)
+                .timeout_config(timeout_config)
+                .retry_config(retry_config)
                 .build();
 
             Client::from_conf(s3_config)
@@ -59,7 +62,7 @@ impl S3LockStore {
         Ok(Self {
             client,
             bucket: config.bucket.clone(),
-            prefix: config.prefix.clone().unwrap_or_else(|| ".grit/locks/".to_string()),
+            prefix: config.prefix.clone().unwrap_or_else(|| DEFAULT_LOCK_PREFIX.to_string()),
             _runtime: rt,
             rt: handle,
         })
@@ -103,13 +106,18 @@ impl S3LockStore {
                 let entry = self.parse_entry(&body)?;
                 Ok(Some(entry))
             }
+            Err(SdkError::ServiceError(ref service_err))
+                if service_err.err().is_no_such_key() =>
+            {
+                Ok(None)
+            }
+            Err(SdkError::ServiceError(ref service_err))
+                if service_err.raw().status().as_u16() == 404 =>
+            {
+                Ok(None)
+            }
             Err(err) => {
-                let err_str = format!("{}", err);
-                if err_str.contains("NoSuchKey") || err_str.contains("404") || err_str.contains("not found") {
-                    Ok(None)
-                } else {
-                    Err(anyhow::anyhow!("S3 GET failed: {}", err))
-                }
+                Err(anyhow::anyhow!("S3 GET failed: {}", err))
             }
         }
     }
@@ -153,14 +161,14 @@ impl S3LockStore {
 
         match result {
             Ok(_) => Ok(true),
+            // 412 Precondition Failed = object already exists
+            Err(SdkError::ServiceError(ref service_err))
+                if service_err.raw().status().as_u16() == 412 =>
+            {
+                Ok(false)
+            }
             Err(err) => {
-                let err_str = format!("{}", err);
-                // 412 Precondition Failed = object already exists
-                if err_str.contains("412") || err_str.contains("PreconditionFailed") || err_str.contains("ConditionalRequestConflict") {
-                    Ok(false)
-                } else {
-                    Err(anyhow::anyhow!("S3 conditional PUT failed: {}", err))
-                }
+                Err(anyhow::anyhow!("S3 conditional PUT failed: {}", err))
             }
         }
     }
@@ -179,11 +187,12 @@ impl S3LockStore {
         Ok(())
     }
 
-    /// LIST all lock objects
+    /// LIST all lock objects, fetching bodies in parallel
     fn list_all_locks(&self) -> Result<Vec<LockEntry>> {
-        let mut entries = Vec::new();
+        let mut all_keys: Vec<String> = Vec::new();
         let mut continuation_token: Option<String> = None;
 
+        // Phase 1: collect all keys
         loop {
             let mut req = self.client
                 .list_objects_v2()
@@ -199,25 +208,7 @@ impl S3LockStore {
 
             for obj in output.contents() {
                 if let Some(key) = obj.key() {
-                    // GET each object to read the lock entry
-                    let get_result = self.rt.block_on(async {
-                        self.client
-                            .get_object()
-                            .bucket(&self.bucket)
-                            .key(key)
-                            .send()
-                            .await
-                    });
-
-                    if let Ok(get_output) = get_result {
-                        if let Ok(body) = self.rt.block_on(async {
-                            get_output.body.collect().await.map(|b| b.to_vec())
-                        }) {
-                            if let Ok(entry) = self.parse_entry(&body) {
-                                entries.push(entry);
-                            }
-                        }
-                    }
+                    all_keys.push(key.to_string());
                 }
             }
 
@@ -228,18 +219,51 @@ impl S3LockStore {
             }
         }
 
+        if all_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: GET all objects in parallel using tokio JoinSet
+        let entries: Vec<LockEntry> = self.rt.block_on(async {
+            let mut set: tokio::task::JoinSet<Option<LockEntry>> = tokio::task::JoinSet::new();
+            for key in all_keys {
+                let client = self.client.clone();
+                let bucket = self.bucket.clone();
+                set.spawn(async move {
+                    let get_result = client
+                        .get_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .send()
+                        .await;
+                    if let Ok(get_output) = get_result {
+                        if let Ok(body) = get_output.body.collect().await.map(|b| b.to_vec()) {
+                            return serde_json::from_slice::<LockEntry>(&body).ok();
+                        }
+                    }
+                    None
+                });
+            }
+            let mut results = Vec::new();
+            while let Some(Ok(entry)) = set.join_next().await {
+                if let Some(e) = entry {
+                    results.push(e);
+                }
+            }
+            results
+        });
+
         Ok(entries)
     }
 }
 
 impl LockStore for S3LockStore {
     fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64) -> Result<LockResult> {
-        let now = Utc::now().to_rfc3339();
         let entry = LockEntry {
             symbol_id: symbol_id.to_string(),
             agent_id: agent_id.to_string(),
             intent: intent.to_string(),
-            locked_at: now.clone(),
+            locked_at: Utc::now().to_rfc3339(),
             ttl_seconds,
         };
 
@@ -322,13 +346,6 @@ impl LockStore for S3LockStore {
             .collect())
     }
 
-    fn is_lock_expired(&self, symbol_id: &str) -> Result<bool> {
-        match self.get_lock(symbol_id)? {
-            Some(entry) => Ok(Self::is_entry_expired(&entry)),
-            None => Ok(false),
-        }
-    }
-
     fn gc_expired_locks(&self) -> Result<usize> {
         let all = self.list_all_locks()?;
         let mut count = 0;
@@ -345,12 +362,14 @@ impl LockStore for S3LockStore {
         let all = self.list_all_locks()?;
         let now = Utc::now().to_rfc3339();
         let mut count = 0;
-        for entry in &all {
+        for entry in all {
             if entry.agent_id == agent_id {
                 let updated = LockEntry {
+                    symbol_id: entry.symbol_id,
+                    agent_id: entry.agent_id,
+                    intent: entry.intent,
                     locked_at: now.clone(),
                     ttl_seconds,
-                    ..entry.clone()
                 };
                 self.put_lock(&updated)?;
                 count += 1;

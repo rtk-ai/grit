@@ -13,14 +13,19 @@ pub struct SqliteLockStore {
 impl SqliteLockStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        crate::db::configure_connection(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Acquire the connection mutex, converting poison errors.
+    fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))
     }
 }
 
 impl LockStore for SqliteLockStore {
     fn try_lock(&self, symbol_id: &str, agent_id: &str, intent: &str, ttl_seconds: u64) -> Result<LockResult> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
+        let conn = self.conn()?;
 
         // Clean up expired lock on this symbol
         conn.execute(
@@ -59,7 +64,7 @@ impl LockStore for SqliteLockStore {
     }
 
     fn release(&self, symbol_id: &str, agent_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
+        let conn = self.conn()?;
         conn.execute(
             "DELETE FROM locks WHERE symbol_id = ?1 AND agent_id = ?2",
             params![symbol_id, agent_id],
@@ -68,7 +73,7 @@ impl LockStore for SqliteLockStore {
     }
 
     fn release_all(&self, agent_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
+        let conn = self.conn()?;
         let count = conn.execute(
             "DELETE FROM locks WHERE agent_id = ?1",
             params![agent_id],
@@ -77,7 +82,7 @@ impl LockStore for SqliteLockStore {
     }
 
     fn all_locks(&self) -> Result<Vec<LockEntry>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT symbol_id, agent_id, intent, locked_at, COALESCE(ttl_seconds, 600)
              FROM locks ORDER BY agent_id, symbol_id"
@@ -95,7 +100,7 @@ impl LockStore for SqliteLockStore {
     }
 
     fn locks_for_agent(&self, agent_id: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
+        let conn = self.conn()?;
         let mut stmt = conn.prepare(
             "SELECT symbol_id, intent FROM locks WHERE agent_id = ?1"
         )?;
@@ -105,19 +110,8 @@ impl LockStore for SqliteLockStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    fn is_lock_expired(&self, symbol_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
-        let expired: bool = conn.query_row(
-            "SELECT (julianday('now') - julianday(locked_at)) * 86400 > COALESCE(ttl_seconds, 600)
-             FROM locks WHERE symbol_id = ?1",
-            params![symbol_id],
-            |row| row.get(0),
-        ).unwrap_or(false);
-        Ok(expired)
-    }
-
     fn gc_expired_locks(&self) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
+        let conn = self.conn()?;
         let count = conn.execute(
             "DELETE FROM locks
              WHERE (julianday('now') - julianday(locked_at)) * 86400 > COALESCE(ttl_seconds, 600)",
@@ -127,7 +121,7 @@ impl LockStore for SqliteLockStore {
     }
 
     fn refresh_ttl(&self, agent_id: &str, ttl_seconds: u64) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))?;
+        let conn = self.conn()?;
         let count = conn.execute(
             "UPDATE locks SET locked_at = datetime('now'), ttl_seconds = ?1 WHERE agent_id = ?2",
             params![ttl_seconds, agent_id],

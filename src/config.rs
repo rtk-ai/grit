@@ -27,7 +27,17 @@ impl GritConfig {
         let path = grit_dir.join("config.json");
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&content)?)
+            match serde_json::from_str(&content) {
+                Ok(config) => Ok(config),
+                Err(e) => {
+                    eprintln!(
+                        "warning: {} is malformed ({}), using default config",
+                        path.display(),
+                        e
+                    );
+                    Ok(Self::default())
+                }
+            }
         } else {
             Ok(Self::default())
         }

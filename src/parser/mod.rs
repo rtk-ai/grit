@@ -26,6 +26,7 @@ struct LangConfig {
     symbol_queries: Vec<(&'static str, NameExtractor)>,
 }
 
+#[allow(dead_code)]
 enum NameExtractor {
     Field(&'static str),
     ChildKind(&'static str),
@@ -42,7 +43,12 @@ impl SymbolIndex {
         let configs = Self::lang_configs();
         let mut all_symbols = Vec::new();
 
+        // Reuse one parser per language instead of creating one per file
+        let mut parser = Parser::new();
+
         for config in &configs {
+            parser.set_language(&config.language)?;
+
             for ext in config.extensions {
                 let pattern = format!("{}/**/*.{}", self.repo_root.display(), ext);
                 for entry in glob::glob(&pattern)? {
@@ -58,7 +64,7 @@ impl SymbolIndex {
                         continue;
                     }
 
-                    match self.parse_file(&path, config) {
+                    match self.parse_file(&path, config, &mut parser) {
                         Ok(symbols) => all_symbols.extend(symbols),
                         Err(e) => {
                             eprintln!("  warn: skipping {}: {}", rel_str, e);
@@ -71,16 +77,13 @@ impl SymbolIndex {
         Ok(all_symbols)
     }
 
-    fn parse_file(&self, path: &Path, config: &LangConfig) -> Result<Vec<Symbol>> {
+    fn parse_file(&self, path: &Path, config: &LangConfig, parser: &mut Parser) -> Result<Vec<Symbol>> {
         let source = std::fs::read_to_string(path)?;
         let rel_path = path
             .strip_prefix(&self.repo_root)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
-
-        let mut parser = Parser::new();
-        parser.set_language(&config.language)?;
 
         let tree = parser
             .parse(&source, None)

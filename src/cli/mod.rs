@@ -168,6 +168,16 @@ pub enum ConfigAction {
     Show,
 }
 
+/// Compute lock expiry locally from the LockEntry data, avoiding extra round-trips
+fn is_entry_expired_local(entry: &LockEntry) -> bool {
+    if let Ok(locked_at) = chrono::DateTime::parse_from_rfc3339(&entry.locked_at) {
+        let elapsed = chrono::Utc::now().signed_duration_since(locked_at);
+        elapsed.num_seconds() as u64 > entry.ttl_seconds
+    } else {
+        true
+    }
+}
+
 /// Validate agent/session identifiers to prevent path traversal and argument injection
 fn validate_identifier(id: &str, label: &str) -> Result<()> {
     if id.is_empty() {
@@ -188,10 +198,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Claim { agent, .. } | Command::Release { agent, .. }
         | Command::Done { agent } | Command::Plan { agent, .. }
         | Command::Heartbeat { agent, .. } => validate_identifier(agent, "agent ID")?,
-        Command::Session { action } => {
-            if let SessionAction::Start { name } = action {
-                validate_identifier(name, "session name")?;
-            }
+        Command::Session { action: SessionAction::Start { name } } => {
+            validate_identifier(name, "session name")?;
         }
         _ => {}
     }
@@ -228,9 +236,28 @@ fn grit_dir(repo: &str) -> std::path::PathBuf {
     std::path::Path::new(repo).join(".grit")
 }
 
+/// Ensure .grit directory exists; bail with a clear message otherwise
+fn ensure_initialized(repo: &str) -> Result<std::path::PathBuf> {
+    let dir = grit_dir(repo);
+    if !dir.exists() {
+        anyhow::bail!(
+            "Not a grit repository (missing {}). Run `grit init` first.",
+            dir.display()
+        );
+    }
+    let db_path = dir.join("registry.db");
+    if !db_path.exists() {
+        anyhow::bail!(
+            "grit registry not found (missing {}). Run `grit init` first.",
+            db_path.display()
+        );
+    }
+    Ok(dir)
+}
+
 /// Resolve the lock store based on config
 fn resolve_lock_store(repo: &str) -> Result<Box<dyn LockStore>> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let config = GritConfig::load(&dir)?;
 
     match config.backend.as_str() {
@@ -288,7 +315,7 @@ fn cmd_init(repo: &str) -> Result<()> {
 }
 
 fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
     let db = Database::open(&dir.join("registry.db"))?; // for symbol queries
 
@@ -334,7 +361,7 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]
         room.notify(&RoomEvent {
             event_type: EventType::Claimed,
             agent: agent.to_string(),
-            symbols: granted.clone(),
+            symbols: granted,
         });
     }
 
@@ -364,7 +391,7 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]
 }
 
 fn cmd_release(repo: &str, agent: &str, symbols: &[String]) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
 
     if symbols.is_empty() {
@@ -393,7 +420,7 @@ fn cmd_release(repo: &str, agent: &str, symbols: &[String]) -> Result<()> {
 }
 
 fn cmd_status(repo: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
 
@@ -416,7 +443,9 @@ fn cmd_status(repo: &str) -> Result<()> {
         let intent = &entries[0].intent;
         println!("{} {} -- {}", "*".green(), agent.bold(), intent.dimmed());
         for entry in entries {
-            let expired = lock_store.is_lock_expired(&entry.symbol_id).unwrap_or(false);
+            // Compute expiry locally from the LockEntry data we already have,
+            // instead of making another round-trip per lock (N+1 on S3 backend)
+            let expired = is_entry_expired_local(entry);
             let status = if expired {
                 "EXPIRED".red().to_string()
             } else {
@@ -437,7 +466,7 @@ fn cmd_status(repo: &str) -> Result<()> {
 }
 
 fn cmd_symbols(repo: &str, file_filter: Option<&str>) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
 
     let symbols = db.list_symbols(file_filter)?;
@@ -466,7 +495,7 @@ fn cmd_symbols(repo: &str, file_filter: Option<&str>) -> Result<()> {
 }
 
 fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
 
     // Search symbols related to the intent keywords
@@ -504,7 +533,7 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
 }
 
 fn cmd_done(repo: &str, agent: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let lock_store = resolve_lock_store(repo)?;
 
     let locks = lock_store.locks_for_agent(agent)?;
@@ -519,8 +548,12 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
         println!("  {} releasing {}", ">".dimmed(), sym);
     }
 
-    // Try to merge worktree back
+    // Always release locks even if merge/cleanup fails,
+    // to prevent orphan locks when the process crashes mid-operation.
     let git_repo = GitRepo::open(repo)?;
+    let mut merge_error: Option<String> = None;
+
+    // Try to merge worktree back
     match git_repo.merge_worktree(agent) {
         Ok(()) => {
             println!("{} Merged branch agent/{}", "+".green(), agent);
@@ -530,7 +563,7 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
             if msg.contains("not found") || msg.contains("does not exist") {
                 // No worktree, that's fine
             } else {
-                eprintln!("  warn: merge failed: {}", e);
+                merge_error = Some(msg);
             }
         }
     }
@@ -548,6 +581,7 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
         }
     }
 
+    // Release locks regardless of merge outcome
     let released = lock_store.release_all(agent)?;
     println!("{} Released {} symbols", "+".green(), released);
 
@@ -559,22 +593,50 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
         symbols: locks.iter().map(|(s, _)| s.clone()).collect(),
     });
 
+    // Report merge failure after cleanup is complete
+    if let Some(err) = merge_error {
+        anyhow::bail!(
+            "Agent {} locks released but merge failed: {}.\n\
+             The agent's changes are still in branch agent/{}.",
+            agent, err, agent
+        );
+    }
+
     Ok(())
 }
 
 fn cmd_watch(repo: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let sock_path = dir.join("room.sock");
 
     if !sock_path.exists() {
-        anyhow::bail!("No room socket found at {}. Run `grit init` first.", sock_path.display());
+        anyhow::bail!(
+            "No room socket found at {}.\n\
+             The notification server only runs during `grit init`.\n\
+             Re-run `grit init` in a long-lived process, or use `grit status` to poll.",
+            sock_path.display()
+        );
     }
 
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixStream;
 
     println!("Connecting to room socket at {}...", sock_path.display());
-    let stream = UnixStream::connect(&sock_path)?;
+    let stream = match UnixStream::connect(&sock_path) {
+        Ok(s) => s,
+        Err(e) => {
+            // Socket file exists but server is dead -- clean up stale socket
+            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                let _ = std::fs::remove_file(&sock_path);
+                anyhow::bail!(
+                    "Room socket is stale (server not running). Removed {}.\n\
+                     Re-run `grit init` to start the notification server.",
+                    sock_path.display()
+                );
+            }
+            return Err(e.into());
+        }
+    };
     let reader = BufReader::new(stream);
 
     println!("Watching for events (Ctrl+C to stop):\n");
@@ -663,7 +725,7 @@ fn cmd_heartbeat(repo: &str, agent: &str, ttl: u64) -> Result<()> {
 // ── Session commands ──
 
 fn cmd_session_start(repo: &str, name: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
     let git_repo = GitRepo::open(repo)?;
 
@@ -688,7 +750,7 @@ fn cmd_session_start(repo: &str, name: &str) -> Result<()> {
 }
 
 fn cmd_session_status(repo: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
     let lock_store = resolve_lock_store(repo)?;
 
@@ -724,7 +786,7 @@ fn cmd_session_status(repo: &str) -> Result<()> {
 }
 
 fn cmd_session_pr(repo: &str, title: Option<&str>) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
     let git_repo = GitRepo::open(repo)?;
 
@@ -777,7 +839,7 @@ fn cmd_session_pr(repo: &str, title: Option<&str>) -> Result<()> {
 }
 
 fn cmd_session_end(repo: &str, _name: Option<&str>) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
     let lock_store = resolve_lock_store(repo)?;
     let git_repo = GitRepo::open(repo)?;
@@ -808,7 +870,7 @@ fn cmd_session_end(repo: &str, _name: Option<&str>) -> Result<()> {
 // ── Config commands ──
 
 fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let config = GritConfig {
         backend: "s3".to_string(),
         s3: Some(S3Config {
@@ -838,7 +900,7 @@ fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &
 }
 
 fn cmd_config_set_local(repo: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let config = GritConfig {
         backend: "local".to_string(),
         s3: None,
@@ -852,7 +914,7 @@ fn cmd_config_set_local(repo: &str) -> Result<()> {
 }
 
 fn cmd_config_show(repo: &str) -> Result<()> {
-    let dir = grit_dir(repo);
+    let dir = ensure_initialized(repo)?;
     let config = GritConfig::load(&dir)?;
 
 

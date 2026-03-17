@@ -28,7 +28,6 @@ pub trait LockStore: Send + Sync {
     fn release_all(&self, agent_id: &str) -> Result<usize>;
     fn all_locks(&self) -> Result<Vec<LockEntry>>;
     fn locks_for_agent(&self, agent_id: &str) -> Result<Vec<(String, String)>>;
-    fn is_lock_expired(&self, symbol_id: &str) -> Result<bool>;
     fn gc_expired_locks(&self) -> Result<usize>;
     fn refresh_ttl(&self, agent_id: &str, ttl_seconds: u64) -> Result<usize>;
 }

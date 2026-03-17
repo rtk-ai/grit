@@ -120,9 +120,13 @@ fn handle_connection(stream: UnixStream, watchers: Arc<Mutex<Vec<UnixStream>>>) 
         _ => {
             // No data within timeout -- this is a watcher.
             // Clear read timeout and park the stream in the watchers list.
+            // Limit max watchers to prevent resource exhaustion (DoS).
+            const MAX_WATCHERS: usize = 128;
             let _ = stream.set_read_timeout(None);
             if let Ok(mut wl) = watchers.lock() {
-                wl.push(stream);
+                if wl.len() < MAX_WATCHERS {
+                    wl.push(stream);
+                }
             }
         }
     }
