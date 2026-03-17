@@ -4,10 +4,6 @@
 
 > When 50 agents work on the same repo, git breaks. Grit doesn't.
 
-![grit demo — 50 agents](demo.gif)
-
-*[Full demo project with source](https://github.com/pszymkowiak/grit-samples)*
-
 Translations: [Francais](docs/README.fr.md) | [Deutsch](docs/README.de.md) | [Espanol](docs/README.es.md) | [Portugues](docs/README.pt.md) | [Italiano](docs/README.it.md) | [Nederlands](docs/README.nl.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh.md) | [한국어](docs/README.ko.md) | [Русский](docs/README.ru.md) | [العربية](docs/README.ar.md) | [हिन्दी](docs/README.hi.md)
 
 ---
