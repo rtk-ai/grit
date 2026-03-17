@@ -120,7 +120,25 @@ impl GitRepo {
         let lock_path = self.grit_dir().join("merge.lock");
         let _lock = self.acquire_file_lock(&lock_path)?;
 
-        // Merge the agent branch into main branch
+        // Get current branch (session branch or main)
+        let current = self.current_branch()?;
+
+        // Rebase agent branch on top of current branch before merging
+        // This ensures agent's changes apply cleanly on top of other agents' work
+        let rebase_output = Command::new("git")
+            .args(["rebase", &current, &branch_name])
+            .current_dir(&self.root)
+            .output()?;
+
+        if !rebase_output.status.success() {
+            // Rebase failed — abort and try merge directly
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(&self.root)
+                .output();
+        }
+
+        // Merge the agent branch into current branch
         let output = Command::new("git")
             .args(["merge", "--no-ff", &branch_name, "-m", &format!("grit: merge agent/{}", agent_id)])
             .current_dir(&self.root)
@@ -171,6 +189,100 @@ impl GitRepo {
             }
         }
         anyhow::bail!("Timeout acquiring merge lock after 10s")
+    }
+
+    /// Get the current branch name
+    pub fn current_branch(&self) -> Result<String> {
+        let output = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&self.root)
+            .output()?;
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if branch.is_empty() {
+            anyhow::bail!("Not on a branch (detached HEAD?)");
+        }
+        Ok(branch)
+    }
+
+    /// Create a session branch (feature branch where agents merge into)
+    pub fn create_session_branch(&self, session_name: &str) -> Result<String> {
+        let branch_name = format!("grit/{}", session_name);
+
+        let output = Command::new("git")
+            .args(["checkout", "-b", &branch_name])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to create session branch")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("already exists") {
+                // Switch to existing branch
+                let output2 = Command::new("git")
+                    .args(["checkout", &branch_name])
+                    .current_dir(&self.root)
+                    .output()?;
+                if !output2.status.success() {
+                    anyhow::bail!("git checkout failed: {}", String::from_utf8_lossy(&output2.stderr));
+                }
+            } else {
+                anyhow::bail!("git checkout -b failed: {}", stderr);
+            }
+        }
+
+        Ok(branch_name)
+    }
+
+    /// Push session branch to remote and create PR via gh CLI
+    pub fn push_and_create_pr(&self, branch: &str, title: &str, body: &str) -> Result<String> {
+        // Push to origin
+        let output = Command::new("git")
+            .args(["push", "-u", "origin", branch])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to push branch")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // "Everything up-to-date" is OK
+            if !stderr.contains("up-to-date") {
+                anyhow::bail!("git push failed: {}", stderr);
+            }
+        }
+
+        // Create PR via gh
+        let output = Command::new("gh")
+            .args(["pr", "create", "--title", title, "--body", body])
+            .current_dir(&self.root)
+            .output()
+            .context("Failed to create PR (is `gh` installed?)")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("already exists") {
+                // PR already exists, get URL
+                let view = Command::new("gh")
+                    .args(["pr", "view", "--json", "url", "-q", ".url"])
+                    .current_dir(&self.root)
+                    .output()?;
+                return Ok(String::from_utf8_lossy(&view.stdout).trim().to_string());
+            }
+            anyhow::bail!("gh pr create failed: {}", stderr);
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Switch back to a branch
+    pub fn checkout(&self, branch: &str) -> Result<()> {
+        let output = Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(&self.root)
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!("git checkout {} failed: {}", branch, String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(())
     }
 
     /// List all active agent worktrees

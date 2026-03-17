@@ -43,3 +43,8 @@ colored = "2"
 
 # UUID for agent IDs
 uuid = { version = "1", features = ["v4"] }
+
+# Cloud storage (S3/R2/GCS/Azure)
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+urlencoding = "2"

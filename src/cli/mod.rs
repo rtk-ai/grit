@@ -1,10 +1,14 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::config::GritConfig;
 use crate::db::Database;
+use crate::db::lock_store::{LockStore, LockResult};
+use crate::db::sqlite_store::SqliteLockStore;
+use crate::db::s3_store::S3Config;
 use crate::git::GitRepo;
 use crate::parser::SymbolIndex;
-use crate::room::{LockResult, Room, RoomEvent, EventType, NotificationServer};
+use crate::room::{Room, RoomEvent, EventType, NotificationServer};
 
 #[derive(Parser)]
 #[command(name = "grit", about = "Coordination layer for parallel AI agents on top of git")]
@@ -90,6 +94,18 @@ pub enum Command {
     /// Garbage-collect expired locks
     Gc,
 
+    /// Manage grit sessions (feature branches for multi-agent work)
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+
+    /// Configure grit backend (local, s3, r2, gcs, azure)
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
     /// Refresh an agent's lock TTL
     Heartbeat {
         /// Agent identifier
@@ -108,6 +124,48 @@ pub enum WorktreeAction {
     List,
 }
 
+#[derive(Subcommand)]
+pub enum SessionAction {
+    /// Start a new session (creates a feature branch)
+    Start {
+        /// Session name (becomes branch grit/<name>)
+        name: String,
+    },
+    /// Show current session info
+    Status,
+    /// Create a PR for the current session
+    Pr {
+        /// PR title (default: session name)
+        #[arg(short, long)]
+        title: Option<String>,
+    },
+    /// End session (close locks, switch back to base branch)
+    End {
+        /// Session name
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Set backend to S3-compatible storage
+    SetS3 {
+        /// S3 bucket name
+        #[arg(long)]
+        bucket: String,
+        /// Custom endpoint (for R2, GCS, Azure, MinIO)
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Region
+        #[arg(long, default_value = "auto")]
+        region: String,
+    },
+    /// Set backend to local SQLite (default)
+    SetLocal,
+    /// Show current config
+    Show,
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init => cmd_init(&cli.repo),
@@ -122,12 +180,43 @@ pub fn run(cli: Cli) -> Result<()> {
             WorktreeAction::List => cmd_worktree_list(&cli.repo),
         },
         Command::Gc => cmd_gc(&cli.repo),
+        Command::Session { action } => match action {
+            SessionAction::Start { name } => cmd_session_start(&cli.repo, &name),
+            SessionAction::Status => cmd_session_status(&cli.repo),
+            SessionAction::Pr { title } => cmd_session_pr(&cli.repo, title.as_deref()),
+            SessionAction::End { name } => cmd_session_end(&cli.repo, name.as_deref()),
+        },
+        Command::Config { action } => match action {
+            ConfigAction::SetS3 { bucket, endpoint, region } => cmd_config_set_s3(&cli.repo, &bucket, endpoint.as_deref(), &region),
+            ConfigAction::SetLocal => cmd_config_set_local(&cli.repo),
+            ConfigAction::Show => cmd_config_show(&cli.repo),
+        },
         Command::Heartbeat { agent, ttl } => cmd_heartbeat(&cli.repo, &agent, ttl),
     }
 }
 
 fn grit_dir(repo: &str) -> std::path::PathBuf {
     std::path::Path::new(repo).join(".grit")
+}
+
+/// Resolve the lock store based on config
+fn resolve_lock_store(repo: &str) -> Result<Box<dyn LockStore>> {
+    let dir = grit_dir(repo);
+    let config = GritConfig::load(&dir)?;
+
+    match config.backend.as_str() {
+        "s3" => {
+            let s3_config = config.s3.ok_or_else(|| anyhow::anyhow!(
+                "S3 backend configured but no S3 config found. Run: grit config set-s3 --bucket <name>"
+            ))?;
+            let store = crate::db::s3_store::S3LockStore::from_config(&s3_config)?;
+            Ok(Box::new(store))
+        }
+        _ => {
+            let store = SqliteLockStore::open(&dir.join("registry.db"))?;
+            Ok(Box::new(store))
+        }
+    }
 }
 
 fn cmd_init(repo: &str) -> Result<()> {
@@ -171,13 +260,14 @@ fn cmd_init(repo: &str) -> Result<()> {
 
 fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]) -> Result<()> {
     let dir = grit_dir(repo);
-    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
+    let db = Database::open(&dir.join("registry.db"))?; // for symbol queries
 
     let mut granted = Vec::new();
     let mut blocked = Vec::new();
 
     for sym_id in symbols {
-        match db.try_lock(sym_id, agent, intent, ttl)? {
+        match lock_store.try_lock(sym_id, agent, intent, ttl)? {
             LockResult::Granted => granted.push(sym_id.clone()),
             LockResult::Blocked { by_agent, by_intent } => {
                 blocked.push((sym_id.clone(), by_agent, by_intent));
@@ -246,14 +336,14 @@ fn cmd_claim(repo: &str, agent: &str, intent: &str, ttl: u64, symbols: &[String]
 
 fn cmd_release(repo: &str, agent: &str, symbols: &[String]) -> Result<()> {
     let dir = grit_dir(repo);
-    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
 
     if symbols.is_empty() {
-        let released = db.release_all(agent)?;
+        let released = lock_store.release_all(agent)?;
         println!("Released {} symbols for {}", released, agent);
     } else {
         for sym_id in symbols {
-            db.release(sym_id, agent)?;
+            lock_store.release(sym_id, agent)?;
             println!("Released {}", sym_id);
         }
     }
@@ -275,9 +365,10 @@ fn cmd_release(repo: &str, agent: &str, symbols: &[String]) -> Result<()> {
 
 fn cmd_status(repo: &str) -> Result<()> {
     let dir = grit_dir(repo);
+    let lock_store = resolve_lock_store(repo)?;
     let db = Database::open(&dir.join("registry.db"))?;
 
-    let locks = db.all_locks()?;
+    let locks = lock_store.all_locks()?;
 
     if locks.is_empty() {
         println!("No active locks.");
@@ -285,28 +376,26 @@ fn cmd_status(repo: &str) -> Result<()> {
     }
 
     use colored::Colorize;
+    use crate::db::lock_store::LockEntry;
 
     // Group by agent
-    let mut by_agent: std::collections::BTreeMap<String, Vec<(String, String, String, u64)>> =
+    let mut by_agent: std::collections::BTreeMap<String, Vec<&LockEntry>> =
         std::collections::BTreeMap::new();
-    for (sym, agent, intent, ts, ttl) in &locks {
-        by_agent
-            .entry(agent.clone())
-            .or_default()
-            .push((sym.clone(), intent.clone(), ts.clone(), *ttl));
+    for entry in &locks {
+        by_agent.entry(entry.agent_id.clone()).or_default().push(entry);
     }
 
-    for (agent, syms) in &by_agent {
-        let intent = &syms[0].1;
+    for (agent, entries) in &by_agent {
+        let intent = &entries[0].intent;
         println!("{} {} -- {}", "*".green(), agent.bold(), intent.dimmed());
-        for (sym, _, ts, ttl) in syms {
-            let expired = db.is_lock_expired(sym).unwrap_or(false);
+        for entry in entries {
+            let expired = lock_store.is_lock_expired(&entry.symbol_id).unwrap_or(false);
             let status = if expired {
                 "EXPIRED".red().to_string()
             } else {
-                format!("ttl={}s", ttl)
+                format!("ttl={}s", entry.ttl_seconds)
             };
-            println!("  {} {} ({}) [{}]", "|".dimmed(), sym, ts.dimmed(), status);
+            println!("  {} {} ({}) [{}]", "|".dimmed(), entry.symbol_id, entry.locked_at.dimmed(), status);
         }
     }
 
@@ -389,9 +478,9 @@ fn cmd_plan(repo: &str, agent: &str, intent: &str) -> Result<()> {
 
 fn cmd_done(repo: &str, agent: &str) -> Result<()> {
     let dir = grit_dir(repo);
-    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
 
-    let locks = db.locks_for_agent(agent)?;
+    let locks = lock_store.locks_for_agent(agent)?;
     if locks.is_empty() {
         println!("Agent {} has no active locks.", agent);
         return Ok(());
@@ -432,7 +521,7 @@ fn cmd_done(repo: &str, agent: &str) -> Result<()> {
         }
     }
 
-    let released = db.release_all(agent)?;
+    let released = lock_store.release_all(agent)?;
     println!("{} Released {} symbols", "+".green(), released);
 
     // Notify
@@ -519,10 +608,9 @@ fn cmd_worktree_list(repo: &str) -> Result<()> {
 }
 
 fn cmd_gc(repo: &str) -> Result<()> {
-    let dir = grit_dir(repo);
-    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
 
-    let expired = db.gc_expired_locks()?;
+    let expired = lock_store.gc_expired_locks()?;
     if expired == 0 {
         println!("No expired locks found.");
     } else {
@@ -533,14 +621,225 @@ fn cmd_gc(repo: &str) -> Result<()> {
 }
 
 fn cmd_heartbeat(repo: &str, agent: &str, ttl: u64) -> Result<()> {
-    let dir = grit_dir(repo);
-    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
 
-    let refreshed = db.refresh_ttl(agent, ttl)?;
+    let refreshed = lock_store.refresh_ttl(agent, ttl)?;
     if refreshed == 0 {
         println!("Agent {} has no active locks to refresh.", agent);
     } else {
         println!("Refreshed TTL for {} locks (new ttl={}s).", refreshed, ttl);
+    }
+
+    Ok(())
+}
+
+// ── Session commands ──
+
+fn cmd_session_start(repo: &str, name: &str) -> Result<()> {
+    let dir = grit_dir(repo);
+    let db = Database::open(&dir.join("registry.db"))?;
+    let git_repo = GitRepo::open(repo)?;
+
+    let base_branch = git_repo.current_branch()?;
+    let branch = git_repo.create_session_branch(name)?;
+    db.create_session(name, &branch, &base_branch)?;
+
+    use colored::Colorize;
+    println!("{} Session started: {}", "+".green(), name.bold());
+    println!("  branch: {}", branch.cyan());
+    println!("  base:   {}", base_branch.dimmed());
+    println!("");
+    println!("Agents can now work:");
+    println!("  grit claim -a agent-1 -i \"task\" <symbols...>");
+    println!("  # edit in .grit/worktrees/agent-1/");
+    println!("  grit done -a agent-1");
+    println!("");
+    println!("When all agents are done:");
+    println!("  grit session pr");
+
+    Ok(())
+}
+
+fn cmd_session_status(repo: &str) -> Result<()> {
+    let dir = grit_dir(repo);
+    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
+
+    use colored::Colorize;
+
+    match db.get_active_session()? {
+        Some((name, branch, base)) => {
+            println!("{} Active session: {}", "*".green(), name.bold());
+            println!("  branch: {}", branch.cyan());
+            println!("  base:   {}", base.dimmed());
+
+            let locks = lock_store.all_locks()?;
+            let git_repo = GitRepo::open(repo)?;
+            let worktrees = git_repo.list_worktrees()?;
+
+            println!("  agents: {} active worktrees", worktrees.len());
+            println!("  locks:  {} symbols locked", locks.len());
+
+            if !worktrees.is_empty() {
+                println!("\n  Active agents:");
+                for wt in &worktrees {
+                    println!("    {} {}", ">".green(), wt);
+                }
+            }
+        }
+        None => {
+            println!("No active session.");
+            println!("Start one with: grit session start <name>");
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_session_pr(repo: &str, title: Option<&str>) -> Result<()> {
+    let dir = grit_dir(repo);
+    let db = Database::open(&dir.join("registry.db"))?;
+    let git_repo = GitRepo::open(repo)?;
+
+    let (name, branch, base) = db.get_active_session()?
+        .ok_or_else(|| anyhow::anyhow!("No active session. Start one with: grit session start <name>"))?;
+
+    // Check for remaining locks
+    let lock_store = resolve_lock_store(repo)?;
+    let locks = lock_store.all_locks()?;
+    let worktrees = git_repo.list_worktrees()?;
+
+    use colored::Colorize;
+
+    if !worktrees.is_empty() {
+        println!("{} Warning: {} agents still have active worktrees:", "!".yellow(), worktrees.len());
+        for wt in &worktrees {
+            println!("  {} {}", ">".yellow(), wt);
+        }
+        println!("Run 'grit done -a <agent>' for each, or proceed anyway.\n");
+    }
+
+    if !locks.is_empty() {
+        println!("{} Warning: {} symbols still locked", "!".yellow(), locks.len());
+    }
+
+    let pr_title = title.unwrap_or(&name);
+
+    // Build PR body with session summary
+    let total_symbols = db.count_symbols()?;
+    let body = format!(
+        "## Summary\n\
+         Multi-agent session `{}` coordinated by grit.\n\n\
+         - **Branch**: `{}` -> `{}`\n\
+         - **Symbols indexed**: {}\n\
+         - **Remaining locks**: {}\n\n\
+         ## Agent Activity\n\
+         Agents worked in isolated git worktrees with AST-level symbol locking.\n\
+         Zero merge conflicts by design.\n\n\
+         ---\n\
+         *Coordinated by [grit](https://github.com/pszymkowiak/grit)*",
+        name, branch, base, total_symbols, locks.len()
+    );
+
+    println!("Creating PR: {} -> {}", branch.cyan(), base.dimmed());
+    let pr_url = git_repo.push_and_create_pr(&branch, pr_title, &body)?;
+
+    println!("{} PR created: {}", "+".green(), pr_url);
+
+    Ok(())
+}
+
+fn cmd_session_end(repo: &str, _name: Option<&str>) -> Result<()> {
+    let dir = grit_dir(repo);
+    let db = Database::open(&dir.join("registry.db"))?;
+    let lock_store = resolve_lock_store(repo)?;
+    let git_repo = GitRepo::open(repo)?;
+
+    let (session_name, _branch, base) = db.get_active_session()?
+        .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+
+    use colored::Colorize;
+
+    // GC any expired locks
+    let expired = lock_store.gc_expired_locks()?;
+    if expired > 0 {
+        println!("  Cleaned up {} expired locks", expired);
+    }
+
+    // Close session in DB
+    db.close_session(&session_name)?;
+
+    // Switch back to base branch
+    git_repo.checkout(&base)?;
+
+    println!("{} Session '{}' ended", "+".green(), session_name.bold());
+    println!("  Switched back to {}", base.cyan());
+
+    Ok(())
+}
+
+// ── Config commands ──
+
+fn cmd_config_set_s3(repo: &str, bucket: &str, endpoint: Option<&str>, region: &str) -> Result<()> {
+    let dir = grit_dir(repo);
+    let config = GritConfig {
+        backend: "s3".to_string(),
+        s3: Some(S3Config {
+            bucket: bucket.to_string(),
+            endpoint: endpoint.map(|s| s.to_string()),
+            region: Some(region.to_string()),
+            prefix: None,
+        }),
+    };
+    config.save(&dir)?;
+
+    use colored::Colorize;
+    println!("{} Backend set to S3", "+".green());
+    println!("  bucket:   {}", bucket.cyan());
+    if let Some(ep) = endpoint {
+        println!("  endpoint: {}", ep.cyan());
+    }
+    println!("  region:   {}", region);
+    println!("");
+    println!("Compatible with: AWS S3, Cloudflare R2, GCS, Azure Blob, MinIO");
+    println!("");
+    println!("Set credentials via environment:");
+    println!("  export AWS_ACCESS_KEY_ID=...");
+    println!("  export AWS_SECRET_ACCESS_KEY=...");
+
+    Ok(())
+}
+
+fn cmd_config_set_local(repo: &str) -> Result<()> {
+    let dir = grit_dir(repo);
+    let config = GritConfig {
+        backend: "local".to_string(),
+        s3: None,
+    };
+    config.save(&dir)?;
+
+    use colored::Colorize;
+    println!("{} Backend set to local (SQLite)", "+".green());
+
+    Ok(())
+}
+
+fn cmd_config_show(repo: &str) -> Result<()> {
+    let dir = grit_dir(repo);
+    let config = GritConfig::load(&dir)?;
+
+    use colored::Colorize;
+    println!("{} Current config:", "*".green());
+    println!("  backend: {}", config.backend.cyan());
+
+    if let Some(ref s3) = config.s3 {
+        println!("  s3.bucket:   {}", s3.bucket);
+        if let Some(ref ep) = s3.endpoint {
+            println!("  s3.endpoint: {}", ep);
+        }
+        if let Some(ref r) = s3.region {
+            println!("  s3.region:   {}", r);
+        }
     }
 
     Ok(())

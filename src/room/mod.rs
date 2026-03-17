@@ -5,14 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LockResult {
-    Granted,
-    Blocked {
-        by_agent: String,
-        by_intent: String,
-    },
-}
+// LockResult is now in db::lock_store
+pub use crate::db::lock_store::LockResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomEvent {

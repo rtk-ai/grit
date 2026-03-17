@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod db;
 mod git;
 mod parser;

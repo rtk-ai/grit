@@ -1,3 +1,7 @@
+pub mod lock_store;
+pub mod sqlite_store;
+pub mod s3_store;
+
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
@@ -42,6 +46,14 @@ impl Database {
                 callee  TEXT NOT NULL REFERENCES symbols(id),
                 kind    TEXT NOT NULL,
                 PRIMARY KEY (caller, callee)
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                name        TEXT PRIMARY KEY,
+                branch      TEXT NOT NULL,
+                base_branch TEXT NOT NULL,
+                created_at  TEXT DEFAULT (datetime('now')),
+                status      TEXT DEFAULT 'active'
             );
 
             CREATE INDEX IF NOT EXISTS idx_locks_agent ON locks(agent_id);
@@ -251,6 +263,38 @@ impl Database {
             [],
         )?;
         Ok(count)
+    }
+
+    // ── Session management ──
+
+    pub fn create_session(&self, name: &str, branch: &str, base_branch: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (name, branch, base_branch) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET status = 'active'",
+            params![name, branch, base_branch],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_active_session(&self) -> Result<Option<(String, String, String)>> {
+        let result = self.conn.query_row(
+            "SELECT name, branch, base_branch FROM sessions WHERE status = 'active' ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+        match result {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn close_session(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET status = 'closed' WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
     }
 
     /// Refresh the TTL for all locks held by an agent
