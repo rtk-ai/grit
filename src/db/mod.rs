@@ -251,3 +251,173 @@ impl Database {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::Symbol;
+    use tempfile::TempDir;
+
+    fn make_symbol(id: &str, file: &str, name: &str, kind: &str) -> Symbol {
+        Symbol {
+            id: id.to_string(),
+            file: file.to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            start_line: 1,
+            end_line: 10,
+            hash: "abc123".to_string(),
+        }
+    }
+
+    fn setup_db() -> (TempDir, Database) {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        db.init_schema().unwrap();
+        (tmp, db)
+    }
+
+    #[test]
+    fn test_open_and_init_schema() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let db = Database::open(&db_path).unwrap();
+        assert!(db.init_schema().is_ok());
+    }
+
+    #[test]
+    fn test_upsert_and_count_symbols() {
+        let (_tmp, db) = setup_db();
+        let symbols: Vec<Symbol> = (0..5)
+            .map(|i| make_symbol(&format!("file.rs::fn{}", i), "file.rs", &format!("fn{}", i), "function"))
+            .collect();
+        db.upsert_symbols(&symbols).unwrap();
+        assert_eq!(db.count_symbols().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_upsert_updates_existing() {
+        let (_tmp, db) = setup_db();
+        let sym = make_symbol("file.rs::foo", "file.rs", "foo", "function");
+        db.upsert_symbols(&[sym]).unwrap();
+        assert_eq!(db.count_symbols().unwrap(), 1);
+
+        // Update same symbol with different hash
+        let updated = Symbol {
+            id: "file.rs::foo".to_string(),
+            file: "file.rs".to_string(),
+            name: "foo".to_string(),
+            kind: "function".to_string(),
+            start_line: 5,
+            end_line: 20,
+            hash: "new_hash".to_string(),
+        };
+        db.upsert_symbols(&[updated]).unwrap();
+        assert_eq!(db.count_symbols().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_list_symbols_no_filter() {
+        let (_tmp, db) = setup_db();
+        let symbols = vec![
+            make_symbol("a.rs::fn1", "a.rs", "fn1", "function"),
+            make_symbol("a.rs::fn2", "a.rs", "fn2", "function"),
+            make_symbol("b.rs::fn3", "b.rs", "fn3", "function"),
+        ];
+        db.upsert_symbols(&symbols).unwrap();
+        let all = db.list_symbols(None).unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_list_symbols_with_filter() {
+        let (_tmp, db) = setup_db();
+        let symbols = vec![
+            make_symbol("src/a.rs::fn1", "src/a.rs", "fn1", "function"),
+            make_symbol("src/a.rs::fn2", "src/a.rs", "fn2", "function"),
+            make_symbol("src/b.rs::fn3", "src/b.rs", "fn3", "function"),
+        ];
+        db.upsert_symbols(&symbols).unwrap();
+        let filtered = db.list_symbols(Some("a.rs")).unwrap();
+        assert_eq!(filtered.len(), 2);
+        for row in &filtered {
+            assert!(row.1.contains("a.rs"));
+        }
+    }
+
+    #[test]
+    fn test_search_symbols() {
+        let (_tmp, db) = setup_db();
+        let symbols = vec![
+            make_symbol("src/auth.rs::login", "src/auth.rs", "login", "function"),
+            make_symbol("src/auth.rs::logout", "src/auth.rs", "logout", "function"),
+            make_symbol("src/db.rs::connect", "src/db.rs", "connect", "function"),
+        ];
+        db.upsert_symbols(&symbols).unwrap();
+        let results = db.search_symbols(&["login"]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].2, "login");
+    }
+
+    #[test]
+    fn test_available_symbols_in_files() {
+        let (_tmp, db) = setup_db();
+        let symbols = vec![
+            make_symbol("f.rs::a", "f.rs", "a", "function"),
+            make_symbol("f.rs::b", "f.rs", "b", "function"),
+            make_symbol("f.rs::c", "f.rs", "c", "function"),
+        ];
+        db.upsert_symbols(&symbols).unwrap();
+
+        // Lock symbol "f.rs::b"
+        db.conn.execute(
+            "INSERT INTO locks (symbol_id, agent_id, intent) VALUES (?1, ?2, ?3)",
+            params!["f.rs::b", "agent-1", "editing"],
+        ).unwrap();
+
+        let available = db.available_symbols_in_files(&["f.rs"]).unwrap();
+        assert_eq!(available.len(), 2);
+        assert!(available.contains(&"f.rs::a".to_string()));
+        assert!(available.contains(&"f.rs::c".to_string()));
+        assert!(!available.contains(&"f.rs::b".to_string()));
+    }
+
+    #[test]
+    fn test_session_lifecycle() {
+        let (_tmp, db) = setup_db();
+        db.create_session("sess1", "feature/x", "main").unwrap();
+
+        let active = db.get_active_session().unwrap();
+        assert!(active.is_some());
+        let (name, branch, base) = active.unwrap();
+        assert_eq!(name, "sess1");
+        assert_eq!(branch, "feature/x");
+        assert_eq!(base, "main");
+
+        db.close_session("sess1").unwrap();
+        let active = db.get_active_session().unwrap();
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn test_no_active_session() {
+        let (_tmp, db) = setup_db();
+        let active = db.get_active_session().unwrap();
+        assert!(active.is_none());
+    }
+
+    #[test]
+    fn test_integrity_check_on_open() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        // First open creates the file
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.init_schema().unwrap();
+        }
+        // Second open runs integrity check on existing DB
+        let result = Database::open(&db_path);
+        assert!(result.is_ok());
+    }
+}
