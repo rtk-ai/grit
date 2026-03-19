@@ -1,5 +1,7 @@
 # grit
 
+> **⚠️ EXPERIMENTAL — This project is in active testing. APIs and behavior may change without notice.**
+
 **Git for AI agents — zero merge conflicts, any number of parallel agents, same codebase.**
 
 > When 50 agents work on the same repo, git breaks. Grit doesn't.

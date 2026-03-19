@@ -3,6 +3,8 @@ name = "grit"
 version = "0.1.0"
 edition = "2021"
 description = "Coordination layer for parallel AI agents on top of git"
+keywords = ["git", "ai-agents", "experimental", "ast", "coordination"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 # CLI
