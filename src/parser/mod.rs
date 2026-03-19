@@ -222,3 +222,363 @@ impl SymbolIndex {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Helper: create a file inside a TempDir, creating parent dirs as needed.
+    fn write_file(dir: &TempDir, rel_path: &str, content: &str) -> PathBuf {
+        let full = dir.path().join(rel_path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&full, content).unwrap();
+        full
+    }
+
+    /// Helper: find symbol by name in a slice.
+    fn find_sym<'a>(symbols: &'a [Symbol], name: &str) -> &'a Symbol {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol '{}' not found in {:?}", name, symbols.iter().map(|s| &s.name).collect::<Vec<_>>()))
+    }
+
+    // ── 1. Rust functions ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rust_functions() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/lib.rs", r#"
+fn alpha() {}
+fn beta(x: i32) -> i32 { x }
+fn gamma() -> String { String::new() }
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let fns: Vec<_> = symbols.iter().filter(|s| s.kind == "function").collect();
+        assert_eq!(fns.len(), 3, "expected 3 functions, got {:?}", fns);
+
+        for name in &["alpha", "beta", "gamma"] {
+            let sym = find_sym(&symbols, name);
+            assert_eq!(sym.kind, "function");
+        }
+    }
+
+    // ── 2. Rust struct + impl ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rust_struct_and_impl() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/model.rs", r#"
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+impl Point {
+    fn distance(&self) -> f64 {
+        (self.x * self.x + self.y * self.y).sqrt()
+    }
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let _struct_sym = find_sym(&symbols, "Point");
+        // The struct itself has kind "struct"; the impl also has name "Point" with kind "impl".
+        let kinds: Vec<_> = symbols.iter().filter(|s| s.name == "Point").map(|s| s.kind.as_str()).collect();
+        assert!(kinds.contains(&"struct"), "expected struct, got {:?}", kinds);
+        assert!(kinds.contains(&"impl"), "expected impl, got {:?}", kinds);
+
+        // The method inside impl should also be extracted
+        let distance = find_sym(&symbols, "distance");
+        assert_eq!(distance.kind, "function");
+    }
+
+    // ── 3. Rust enum + trait ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rust_enum_and_trait() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/types.rs", r#"
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+trait Drawable {
+    fn draw(&self);
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let color = find_sym(&symbols, "Color");
+        assert_eq!(color.kind, "enum");
+
+        let drawable = find_sym(&symbols, "Drawable");
+        assert_eq!(drawable.kind, "trait");
+    }
+
+    // ── 4. TypeScript functions ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_typescript_functions() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/utils.ts", r#"
+function add(a: number, b: number): number {
+    return a + b;
+}
+
+function greet(name: string): string {
+    return `Hello, ${name}`;
+}
+
+function noop(): void {}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let fns: Vec<_> = symbols.iter().filter(|s| s.kind == "function").collect();
+        assert_eq!(fns.len(), 3);
+
+        for name in &["add", "greet", "noop"] {
+            let sym = find_sym(&symbols, name);
+            assert_eq!(sym.kind, "function");
+        }
+    }
+
+    // ── 5. TypeScript class + methods ──────────────────────────────────
+
+    #[test]
+    fn test_parse_typescript_class() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/service.ts", r#"
+class UserService {
+    getUser(id: number): string {
+        return "user";
+    }
+    deleteUser(id: number): void {}
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let cls = find_sym(&symbols, "UserService");
+        assert_eq!(cls.kind, "class");
+
+        let methods: Vec<_> = symbols.iter().filter(|s| s.kind == "method").collect();
+        assert_eq!(methods.len(), 2);
+        find_sym(&symbols, "getUser");
+        find_sym(&symbols, "deleteUser");
+    }
+
+    // ── 6. TypeScript interface ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_typescript_interface() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/types.ts", r#"
+interface Config {
+    host: string;
+    port: number;
+}
+
+interface Logger {
+    log(msg: string): void;
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let interfaces: Vec<_> = symbols.iter().filter(|s| s.kind == "interface").collect();
+        assert_eq!(interfaces.len(), 2);
+        find_sym(&symbols, "Config");
+        find_sym(&symbols, "Logger");
+    }
+
+    // ── 7. Python functions ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_python_functions() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "utils.py", r#"
+def connect(host, port):
+    pass
+
+def disconnect():
+    pass
+
+def retry(fn, times=3):
+    pass
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let fns: Vec<_> = symbols.iter().filter(|s| s.kind == "function").collect();
+        assert_eq!(fns.len(), 3);
+        for name in &["connect", "disconnect", "retry"] {
+            find_sym(&symbols, name);
+        }
+    }
+
+    // ── 8. Python class + methods ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_python_class() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "models.py", r#"
+class Dog:
+    def __init__(self, name):
+        self.name = name
+
+    def bark(self):
+        return "woof"
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let cls = find_sym(&symbols, "Dog");
+        assert_eq!(cls.kind, "class");
+
+        // Python methods are function_definition nodes inside a class — they get kind "function"
+        let methods: Vec<_> = symbols.iter().filter(|s| s.kind == "function").collect();
+        assert!(methods.len() >= 2, "expected at least __init__ and bark");
+        find_sym(&symbols, "__init__");
+        find_sym(&symbols, "bark");
+    }
+
+    // ── 9. JavaScript functions ────────────────────────────────────────
+
+    #[test]
+    fn test_parse_javascript_functions() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "lib/helpers.js", r#"
+function sum(a, b) {
+    return a + b;
+}
+
+function multiply(a, b) {
+    return a * b;
+}
+"#);
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        let fns: Vec<_> = symbols.iter().filter(|s| s.kind == "function").collect();
+        assert_eq!(fns.len(), 2);
+        find_sym(&symbols, "sum");
+        find_sym(&symbols, "multiply");
+    }
+
+    // ── 10. Symbol ID format ───────────────────────────────────────────
+
+    #[test]
+    fn test_symbol_id_format() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "src/core/engine.rs", "fn run() {}\n");
+
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+        assert_eq!(symbols.len(), 1);
+
+        let sym = &symbols[0];
+        assert_eq!(sym.id, "src/core/engine.rs::run");
+        assert_eq!(sym.file, "src/core/engine.rs");
+        assert_eq!(sym.name, "run");
+    }
+
+    // ── 11. Hash determinism ───────────────────────────────────────────
+
+    #[test]
+    fn test_symbol_hash_deterministic() {
+        let dir1 = TempDir::new().unwrap();
+        let dir2 = TempDir::new().unwrap();
+        let code = "fn deterministic() { let x = 42; }\n";
+        write_file(&dir1, "a.rs", code);
+        write_file(&dir2, "a.rs", code);
+
+        let s1 = SymbolIndex::new(dir1.path().to_str().unwrap()).unwrap().scan_all().unwrap();
+        let s2 = SymbolIndex::new(dir2.path().to_str().unwrap()).unwrap().scan_all().unwrap();
+
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s1[0].hash, s2[0].hash, "same source text must produce the same hash");
+        assert!(!s1[0].hash.is_empty());
+    }
+
+    // ── 12. Skips node_modules ─────────────────────────────────────────
+
+    #[test]
+    fn test_skips_node_modules() {
+        let dir = TempDir::new().unwrap();
+        // File inside a nested node_modules — should be skipped
+        // Note: the skip filter checks for "/node_modules/" in the relative path,
+        // so node_modules must be inside a parent directory (e.g., src/node_modules/).
+        write_file(&dir, "src/node_modules/lodash/index.js", "function chunk() {}\n");
+        // File outside node_modules — should be found
+        write_file(&dir, "src/app.js", "function main() {}\n");
+
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        assert_eq!(symbols.len(), 1, "only src/app.js should be scanned");
+        assert_eq!(symbols[0].name, "main");
+    }
+
+    // ── 13. Normalize kind (via public interface) ──────────────────────
+
+    #[test]
+    fn test_normalize_kind() {
+        let dir = TempDir::new().unwrap();
+
+        // Rust: function_item → "function", struct_item → "struct", enum_item → "enum",
+        //       trait_item → "trait", impl_item → "impl"
+        write_file(&dir, "src/all.rs", r#"
+fn my_func() {}
+struct MyStruct { x: i32 }
+enum MyEnum { A, B }
+trait MyTrait { fn do_it(&self); }
+impl MyStruct { fn method(&self) {} }
+"#);
+
+        // TypeScript: function_declaration → "function", class_declaration → "class",
+        //             method_definition → "method", interface_declaration → "interface"
+        write_file(&dir, "src/all.ts", r#"
+function tsFunc(): void {}
+class TsClass {
+    tsMethod(): void {}
+}
+interface TsInterface { x: number; }
+"#);
+
+        // Python: function_definition → "function", class_definition → "class"
+        write_file(&dir, "all.py", "def py_func():\n    pass\n\nclass PyClass:\n    pass\n");
+
+        let idx = SymbolIndex::new(dir.path().to_str().unwrap()).unwrap();
+        let symbols = idx.scan_all().unwrap();
+
+        // Verify the normalized kinds
+        assert_eq!(find_sym(&symbols, "my_func").kind, "function");
+        assert_eq!(find_sym(&symbols, "MyStruct").kind, "struct");
+        assert_eq!(find_sym(&symbols, "MyEnum").kind, "enum");
+        assert_eq!(find_sym(&symbols, "MyTrait").kind, "trait");
+        // impl MyStruct → name="MyStruct", kind="impl" (second entry with that name)
+        let impls: Vec<_> = symbols.iter().filter(|s| s.kind == "impl").collect();
+        assert!(!impls.is_empty(), "expected at least one impl symbol");
+
+        assert_eq!(find_sym(&symbols, "tsFunc").kind, "function");
+        assert_eq!(find_sym(&symbols, "TsClass").kind, "class");
+        assert_eq!(find_sym(&symbols, "tsMethod").kind, "method");
+        assert_eq!(find_sym(&symbols, "TsInterface").kind, "interface");
+
+        assert_eq!(find_sym(&symbols, "py_func").kind, "function");
+        assert_eq!(find_sym(&symbols, "PyClass").kind, "class");
+    }
+}

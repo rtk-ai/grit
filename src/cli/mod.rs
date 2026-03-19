@@ -933,3 +933,83 @@ fn cmd_config_show(repo: &str) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::lock_store::LockEntry;
+
+    // ── validate_identifier tests ──
+
+    #[test]
+    fn test_validate_identifier_valid() {
+        assert!(validate_identifier("agent-1", "id").is_ok());
+        assert!(validate_identifier("my_agent", "id").is_ok());
+        assert!(validate_identifier("agent.v2", "id").is_ok());
+        assert!(validate_identifier("abc123", "id").is_ok());
+    }
+
+    #[test]
+    fn test_validate_identifier_empty() {
+        assert!(validate_identifier("", "id").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_path_traversal() {
+        assert!(validate_identifier("..", "id").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_slash() {
+        assert!(validate_identifier("foo/bar", "id").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_backslash() {
+        assert!(validate_identifier("foo\\bar", "id").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_starts_with_dash() {
+        assert!(validate_identifier("-agent", "id").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_special_chars() {
+        assert!(validate_identifier("foo@bar", "id").is_err());
+        assert!(validate_identifier("foo bar", "id").is_err());
+        assert!(validate_identifier("foo;rm", "id").is_err());
+    }
+
+    // ── is_entry_expired_local tests ──
+
+    fn make_entry(locked_at: &str, ttl: u64) -> LockEntry {
+        LockEntry {
+            symbol_id: "test::sym".to_string(),
+            agent_id: "agent-1".to_string(),
+            intent: "testing".to_string(),
+            locked_at: locked_at.to_string(),
+            ttl_seconds: ttl,
+        }
+    }
+
+    #[test]
+    fn test_is_entry_expired_local_fresh() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let entry = make_entry(&now, 600);
+        assert!(!is_entry_expired_local(&entry));
+    }
+
+    #[test]
+    fn test_is_entry_expired_local_expired() {
+        let one_hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let entry = make_entry(&one_hour_ago, 60);
+        assert!(is_entry_expired_local(&entry));
+    }
+
+    #[test]
+    fn test_is_entry_expired_local_bad_timestamp() {
+        let entry = make_entry("not-a-timestamp", 600);
+        assert!(is_entry_expired_local(&entry));
+    }
+}
