@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/rtk-ai/grit/compare/v0.2.0...v0.3.0) (2026-04-06)
+
+
+### Features
+
+* assign, queue, S3 events, dependency-aware locking ([#12](https://github.com/rtk-ai/grit/issues/12) [#13](https://github.com/rtk-ai/grit/issues/13) [#15](https://github.com/rtk-ai/grit/issues/15) [#17](https://github.com/rtk-ai/grit/issues/17)) ([#19](https://github.com/rtk-ai/grit/issues/19)) ([a2c4873](https://github.com/rtk-ai/grit/commit/a2c48735e0a16c49ca1541c4865fce438c479405))
+
 ## [0.2.0](https://github.com/rtk-ai/grit/compare/v0.1.0...v0.2.0) (2026-03-28)
 
 
