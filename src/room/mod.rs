@@ -72,6 +72,11 @@ impl NotificationServer {
         }
 
         let listener = UnixListener::bind(&self.socket_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let watchers: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
 
         let watchers_ref = watchers.clone();
