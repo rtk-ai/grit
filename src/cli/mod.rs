@@ -270,6 +270,13 @@ fn validate_identifier(id: &str, label: &str) -> Result<()> {
             id
         );
     }
+    if id == "." || id.starts_with('.') || id.ends_with('.') {
+        anyhow::bail!(
+            "Invalid {}: '{}' must not be '.', start with '.', or end with '.'",
+            label,
+            id
+        );
+    }
     if !id
         .chars()
         .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
@@ -1583,6 +1590,13 @@ mod tests {
     #[test]
     fn test_validate_identifier_starts_with_dash() {
         assert!(validate_identifier("-agent", "id").is_err());
+    }
+
+    #[test]
+    fn test_validate_identifier_dot_edges() {
+        assert!(validate_identifier(".", "id").is_err());
+        assert!(validate_identifier(".agent", "id").is_err());
+        assert!(validate_identifier("agent.", "id").is_err());
     }
 
     #[test]
